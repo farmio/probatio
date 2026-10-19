@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from types import MappingProxyType
-from typing import Annotated, TypedDict
+from typing import Annotated, NotRequired, TypedDict
 
 import pytest
 
@@ -938,6 +938,42 @@ def test_failing_deep_recursion_costs_linear_time() -> None:
         for index in range(depth):
             data = {"value": index, "nxt": data}
         schema = DataclassSchema(_Chain)
+        start = time.perf_counter()
+        with pytest.raises(MultipleInvalid, match="expected int"):
+            schema(data)
+        assert time.perf_counter() - start < 1.0
+    finally:
+        set_compile_policy(CompilePolicy.OFF)
+
+
+class _Link(TypedDict):
+    """A self-referential TypedDict, for the deep-failure regression test."""
+
+    value: int
+    nxt: NotRequired[_Link | None]
+
+
+def test_recursive_typeddict_keeps_the_cycle_interpreted() -> None:
+    """A TypedDict on a recursion cycle never compiles; the schema above it does.
+
+    The inner schema the builder makes for ``_Link`` refers back to itself, so it
+    is pinned interpreted under the ``compile=True`` flag and the ON policy alike.
+    The top-level ``TypedDictSchema`` sits above the cycle and still generates, so
+    a failure deep in the data is validated once per level, not 2**depth.
+    """
+    set_compile_policy(CompilePolicy.ON)
+    try:
+        schema = TypedDictSchema(_Link, compile=True).compile()
+        assert _is_compiled(schema)
+        # The recursive reference holds the inner schema's engine: the interpreted
+        # mapping validator when pinned, a generated function if it had compiled.
+        ref = schema.schema["nxt"].validator
+        assert isinstance(ref._validate, _MappingValidator)
+
+        depth = 24
+        data: dict[str, object] = {"value": "bottom"}
+        for index in range(depth):
+            data = {"value": index, "nxt": data}
         start = time.perf_counter()
         with pytest.raises(MultipleInvalid, match="expected int"):
             schema(data)

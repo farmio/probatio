@@ -1480,7 +1480,12 @@ def create_typeddict_schema(
         compiled=_compile,
     )
 
-    inner = Schema(mapping, extra=extra, compile=_compile)
+    # A TypedDict on a recursion cycle is pinned interpreted, for the reason a
+    # dataclass on one is (see ``_mark_cycle``): a generated validator bails to its
+    # interpreted twin on a failure, which re-enters the generated code below it,
+    # so a compiled schema on a cycle makes a failing validation exponential in
+    # the data's depth. ``compile=False`` never arms, under any policy.
+    inner = Schema(mapping, extra=extra, compile=False if ref.on_cycle else _compile)
     ref.bind(inner)
 
     return inner
