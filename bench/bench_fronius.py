@@ -1,6 +1,7 @@
-"""Validate a Fronius inverter response: mashumaro vs probatio (interpreted and compiled).
+"""Validate a Fronius inverter response: pyfronius vs mashumaro vs probatio.
 
-Run with: ``uv run --no-sync python bench/bench_fronius.py``.
+Run with: ``uv run --no-sync python bench/bench_fronius.py`` (after
+``uv sync --group bench-fronius``, which ``just bench-fronius`` does for you).
 
 The workload is one real-world request: the Fronius Solar API v1
 ``GetInverterRealtimeData.cgi`` response (``Scope=Device``,
@@ -9,6 +10,17 @@ integration polls from every inverter. It is a deeper, more irregular shape than
 synthetic rows in ``bench_dataclass.py``: three levels of nesting, API keys that do
 not match Python field names (``Head``, ``DAY_ENERGY``, ``MgmtTimerRemainingTime``),
 unit/value pairs that repeat ten times, and two fields an inverter omits at night.
+
+pyfronius is the baseline: it is the library Home Assistant's Fronius integration
+actually uses. It does no schema validation at all. Its parsing step checks the
+head's status code, then copies each known key into a flat ``{name: {"value",
+"unit"}}`` dict with hand-written ``if key in data`` lines, trusting every value.
+The benchmark calls that step directly (the two static converters its
+``current_inverter_data`` runs on the fetched JSON), so no network is involved.
+Note that it formats the whole payload into a debug log message on every call,
+whether or not debug logging is on. That is part of what it costs in practice, and
+it is about 45 percent of its time here (formatting the ``Body.Data`` dict alone
+takes about 4µs of its roughly 9µs), which is why it trails mashumaro.
 
 The tree is modeled two ways, because the key naming decides which engine runs:
 
@@ -42,6 +54,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any
 
 from mashumaro import DataClassDictMixin
+from pyfronius import Fronius
 
 import probatio
 
@@ -400,6 +413,21 @@ PAYLOADS = [
     ("night, no DC", _night_payload()),
 ]
 
+
+def pyfronius_parse(response: dict[str, Any]) -> dict[str, Any]:
+    """Parse the response the way ``Fronius.current_inverter_data`` does, minus the fetch.
+
+    Mirrors its ``_current_data``: the head's status block first, a non-zero status
+    code is an error, then the body through the inverter converter.
+    """
+    sensor = Fronius._status_data(response)
+    if sensor["status"]["Code"] != 0:
+        message = f"bad status {sensor['status']['Code']}"
+        raise ValueError(message)
+    sensor.update(Fronius._device_inverter_data(response["Body"]["Data"]))
+    return sensor
+
+
 MODELS = [
     ("aliased", InverterRealtimeDataMashumaro, InverterRealtimeData),
     ("api-named", InverterRealtimeDataApiMashumaro, InverterRealtimeDataApi),
@@ -431,10 +459,18 @@ def _pac_value(built: Any) -> float:
 def measure() -> list[dict[str, Any]]:
     """Time every model and payload.
 
-    Returns ``[{model, scenario, mashumaro, probatio, compiled, generated}]``;
-    ``generated`` is whether ``.compile()`` produced generated code (``compiled`` is
-    the interpreted engine again when it did not).
+    Returns ``[{model, scenario, pyfronius, mashumaro, probatio, compiled,
+    generated}]``; ``generated`` is whether ``.compile()`` produced generated code
+    (``compiled`` is the interpreted engine again when it did not). pyfronius has no
+    model, so it is timed once per payload and repeated on each model's row.
     """
+    pyfronius_us = {}
+    for scenario, payload in PAYLOADS:
+        assert pyfronius_parse(payload)["power_ac"]["value"] == _pac_value(
+            InverterRealtimeDataMashumaro.from_dict(payload)
+        )
+        pyfronius_us[scenario] = _per_op_us(pyfronius_parse, payload)
+
     rows: list[dict[str, Any]] = []
     for model, mash_cls, cls in MODELS:
         mash = mash_cls.from_dict
@@ -451,6 +487,7 @@ def measure() -> list[dict[str, Any]]:
                 {
                     "model": model,
                     "scenario": scenario,
+                    "pyfronius": pyfronius_us[scenario],
                     "mashumaro": _per_op_us(mash, payload),
                     "probatio": _per_op_us(interp, payload),
                     "compiled": _per_op_us(compiled, payload),
@@ -464,6 +501,11 @@ def describe_rejection() -> list[tuple[str, str]]:
     """Report what each library does with ``PAC.Value`` as the string ``"300"``."""
     payload = _malformed_payload()
     outcomes: list[tuple[str, str]] = []
+
+    parsed = pyfronius_parse(payload)
+    outcomes.append(
+        ("pyfronius", f"accepted, power_ac value = {parsed['power_ac']['value']!r}")
+    )
 
     built = InverterRealtimeDataMashumaro.from_dict(payload)
     outcomes.append(
@@ -486,8 +528,8 @@ def describe_rejection() -> list[tuple[str, str]]:
 def main() -> None:
     """Run the Fronius response through mashumaro and both probatio engines."""
     header = (
-        f"{'model':<10} {'scenario':<13} {'mashumaro':>11} {'probatio':>11} "
-        f"{'compiled':>11} {'comp vs mash':>13}"
+        f"{'model':<10} {'scenario':<13} {'pyfronius':>11} {'mashumaro':>11} "
+        f"{'probatio':>11} {'compiled':>11} {'comp vs mash':>13}"
     )
     print(header)
     print("-" * len(header))
@@ -498,8 +540,8 @@ def main() -> None:
         else:
             compiled_cell = f"{'(interp)':>11} {interp_us / mash_us:>12.2f}x"
         print(
-            f"{row['model']:<10} {row['scenario']:<13} {mash_us:>9.3f}µs "
-            f"{interp_us:>9.3f}µs {compiled_cell}"
+            f"{row['model']:<10} {row['scenario']:<13} {row['pyfronius']:>9.3f}µs "
+            f"{mash_us:>9.3f}µs {interp_us:>9.3f}µs {compiled_cell}"
         )
     print(
         "\nTimes are microseconds per construction (lower is faster). 'comp vs mash' "
@@ -509,7 +551,8 @@ def main() -> None:
         "compiles. Where it did generate, only the top-level mapping is generated "
         "code; the nine nested dataclass mappings stay interpreted, which is why "
         "the gain is small. mashumaro only deserializes; probatio also validates "
-        "every leaf's type, so it does more work for that price.\n"
+        "every leaf's type, so it does more work for that price. pyfronius neither "
+        "validates nor constructs: it copies known keys into a flat dict.\n"
     )
 
     print('With PAC.Value sent as the string "300":')

@@ -74,6 +74,7 @@ bench-dataclass:
 
 # Print a real-world request comparison against mashumaro: a Fronius inverter response.
 bench-fronius:
+    uv sync --group bench-fronius
     uv run --no-sync python bench/bench_fronius.py
 
 # Print the cross-library "rest of the world" comparison (dict to object).

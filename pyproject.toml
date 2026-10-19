@@ -129,6 +129,11 @@ bench-world = [
   # docs. Benchmark-only; never a runtime or test dependency.
   "matplotlib==3.11.1",
 ]
+# The Fronius inverter benchmark (bench_fronius.py): pyfronius is the library Home
+# Assistant's Fronius integration uses, so its parsing step is the real-world
+# baseline. Benchmark-only, installed on demand (just bench-fronius syncs this
+# group); never a runtime or test dependency, and not a correctness oracle.
+bench-fronius = [{ include-group = "test" }, "pyfronius==0.8.2"]
 # Everything needed for local development, in one install. Includes the `just`
 # task runner (the `rust-just` wheel bundles the binary), so `uv run just` works
 # with no separate install.
